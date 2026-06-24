@@ -126,12 +126,15 @@
         location.reload();
     }
 
-    // SP 变量系统
+    // SP 变量系统（正则预编译缓存，避免每次 new RegExp）
+    const VAR_KEYS = ['{date}', '{time}', '{datetime}', '{year}', '{month}', '{day}', '{hour}', '{minute}', '{weekday}', '{weekday_en}', '{timestamp}', '{random}'];
+    const VAR_REGEX_CACHE = new Map();
+    VAR_KEYS.forEach(k => { VAR_REGEX_CACHE.set(k, new RegExp(k.replace(/[{}]/g, '\\$&'), 'g')); });
     function replaceVariables(text) {
         if (!text) return text;
         const now = new Date();
         const pad = n => n.toString().padStart(2, '0');
-        const variables = {
+        const values = {
             '{date}': `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`,
             '{time}': `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`,
             '{datetime}': `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`,
@@ -146,8 +149,8 @@
             '{random}': Math.random().toString(36).substring(2, 8)
         };
         let result = text;
-        for (const [key, value] of Object.entries(variables)) {
-            result = result.replace(new RegExp(key.replace(/[{}]/g, '\\$&'), 'g'), value);
+        for (const key of VAR_KEYS) {
+            result = result.replace(VAR_REGEX_CACHE.get(key), values[key]);
         }
         return result;
     }
@@ -550,20 +553,30 @@
     let expertDebounceTimer = null;
 
     function findAndClick() {
-        const elements = document.querySelectorAll('*');
-        let target = null;
-        for (const el of elements) {
-            if (el.childNodes.length === 1 && el.childNodes[0].nodeType === Node.TEXT_NODE) {
-                if (el.textContent.trim() === '专家模式') { target = el; break; }
-            }
-        }
-        if (!target) return;
-        let clickTarget = target.closest('.dfb78875') || target.parentElement;
-        if (!clickTarget) return;
         if (hasClicked) return;
-        console.log('[专家模式] 检测到按钮，点击切换...');
-        clickTarget.click();
-        hasClicked = true;
+        // TreeWalker 只遍历文本节点，避免 querySelectorAll('*') 几千个元素的全量遍历
+        const walker = document.createTreeWalker(
+            document.body,
+            NodeFilter.SHOW_TEXT,
+            {
+                acceptNode: function (node) {
+                    return node.nodeValue.trim() === '专家模式'
+                        ? NodeFilter.FILTER_ACCEPT
+                        : NodeFilter.FILTER_SKIP;
+                }
+            }
+        );
+        let node;
+        while ((node = walker.nextNode())) {
+            const parent = node.parentElement;
+            if (!parent) continue;
+            const clickTarget = parent.closest('.dfb78875') || parent;
+            if (!clickTarget) continue;
+            log('[专家模式] 检测到按钮，点击切换...');
+            clickTarget.click();
+            hasClicked = true;
+            return;
+        }
     }
     function debouncedExpertCheck() {
         if (expertDebounceTimer) clearTimeout(expertDebounceTimer);
@@ -1952,17 +1965,32 @@ const ICON_MODULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
         for (let i = 0; i < str.length; i++) { hash = ((hash << 5) - hash) + str.charCodeAt(i); hash = hash & hash; }
         return hash;
     }
-    function cleanupDisplayedPrompts() {
+    function cleanupDisplayedPrompts(affectedRoots) {
         if (!systemPrompt && !(prefixEnabled && messagePrefix)) return;
-        const allDivs = document.querySelectorAll('div');
-        allDivs.forEach(el => {
-            if (el.closest('.dsp-fab-container, .dsp-panel, .dsp-fab, .dsp-quick-toggle, .dsp-toast')) return;
-            if (el.classList.contains('dsp-fab-container') || el.classList.contains('dsp-panel') || el.classList.contains('dsp-fab') || el.classList.contains('dsp-quick-toggle') || el.classList.contains('dsp-toast')) return;
+        // 增量模式：只扫描受影响的子树；无参数时全量扫描（首次调用）
+        let allDivs;
+        if (affectedRoots && affectedRoots.length > 0) {
+            const divSet = new Set();
+            for (const root of affectedRoots) {
+                if (!root.isConnected) continue;
+                if (root.tagName === 'DIV') divSet.add(root);
+                if (root.querySelectorAll) {
+                    root.querySelectorAll('div').forEach(d => divSet.add(d));
+                }
+            }
+            allDivs = Array.from(divSet);
+        } else {
+            allDivs = document.querySelectorAll('div');
+        }
+        for (let i = 0; i < allDivs.length; i++) {
+            const el = allDivs[i];
+            if (el.closest('.dsp-fab-container, .dsp-panel, .dsp-fab, .dsp-quick-toggle, .dsp-toast')) continue;
+            if (el.classList.contains('dsp-fab-container') || el.classList.contains('dsp-panel') || el.classList.contains('dsp-fab') || el.classList.contains('dsp-quick-toggle') || el.classList.contains('dsp-toast')) continue;
             const text = el.textContent || '';
             const html = el.innerHTML || '';
             const ch = simpleHash(html);
             const lh = cleanedContentHashes.get(el);
-            if (lh === ch) return;
+            if (lh === ch) continue;
             const hasToken = html.includes('&lt;｜System｜&gt;') || html.includes('&lt;｜User｜&gt;') || text.includes(DS_TOKENS.SYSTEM) || text.includes(DS_TOKENS.USER);
             const spStart = systemPrompt.substring(0, Math.min(20, systemPrompt.length));
             const hasPC = spStart.length >= 10 && text.includes(spStart);
@@ -1977,7 +2005,7 @@ const ICON_MODULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
                     if (cleanElement(el)) cleanedContentHashes.set(el, simpleHash(el.innerHTML));
                 }
             }
-        });
+        }
     }
     function cleanElement(el) {
         let html = el.innerHTML;
@@ -2046,11 +2074,22 @@ const ICON_MODULES = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
         return modified;
     }
     function setupDOMObserver() {
-        const observer = new MutationObserver(() => {
+        let pendingRoots = new Set();
+        const observer = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                if (m.type === 'childList') {
+                    m.addedNodes.forEach(n => { if (n.nodeType === 1) pendingRoots.add(n); });
+                }
+                if (m.target.nodeType === 1) pendingRoots.add(m.target);
+            }
             clearTimeout(window._dspCleanupTimeout);
             window._dspCleanupTimeout = setTimeout(() => {
-                if ((systemPrompt && isEnabled) || (prefixEnabled && messagePrefix)) cleanupDisplayedPrompts();
-            }, 50);
+                if ((systemPrompt && isEnabled) || (prefixEnabled && messagePrefix)) {
+                    const roots = Array.from(pendingRoots).filter(n => n.isConnected);
+                    cleanupDisplayedPrompts(roots.length > 0 && roots.length < 300 ? roots : null);
+                }
+                pendingRoots.clear();
+            }, 150);
         });
         observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     }
