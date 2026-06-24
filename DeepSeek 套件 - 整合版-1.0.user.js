@@ -717,6 +717,75 @@
             target.dataset.vizHidden = 'true';
         }
     }
+    // ── Twist 专用：TextNode 非破坏性渲染辅助 ──
+    // TextNode 无法直接设置 style / dataset，任何移动/替换都会破坏 React 虚拟 DOM
+    // 引用一致性（parentNode.removeChild 失败 → [resetAppOnFatal]）。
+    // 这里采用「保留 TextNode 原位置 + 在其旁插入渲染容器 + 清空其 nodeValue」的方案。
+    const twistTextRenderMap = new WeakMap();
+    function getOrCreateTwistTextRenderContainer(textNode, sourceTag) {
+        const parent = textNode.parentNode;
+        if (!parent || parent.nodeType !== 1) return null;
+        // 1) WeakMap 缓存（流式更新幂等性）
+        let container = twistTextRenderMap.get(textNode);
+        if (container && container.isConnected && container.parentNode === parent) {
+            return container;
+        }
+        // 2) 兜底：扫描紧邻的下一个 Element 兄弟
+        const next = textNode.nextSibling;
+        if (next && next.nodeType === 1 && next.dataset &&
+            next.dataset.vizSource === sourceTag) {
+            twistTextRenderMap.set(textNode, next);
+            return next;
+        }
+        // 3) 创建新容器，插入到 textNode 之后（不替换、不移动原 TextNode）
+        const c = document.createElement('span');
+        c.dataset.vizSource = sourceTag;
+        parent.insertBefore(c, textNode.nextSibling);
+        twistTextRenderMap.set(textNode, c);
+        return c;
+    }
+    function hideOriginalTextNode(textNode) {
+        // 隐藏原 TextNode：清空 nodeValue，不改变 DOM 结构。
+        // React 重新调和时仍能通过其持有的 Node 引用找到此 TextNode 并安全更新。
+        if (textNode.nodeValue !== '') textNode.nodeValue = '';
+    }
+    // ── 激活 innerHTML 插入的 <script> 和内联事件 ──
+    // 浏览器安全策略导致通过 innerHTML 插入的 <script> 不会执行，
+    // onclick / onmouseover 等内联事件属性也不会绑定。
+    // 本函数遍历容器内所有元素，用 replaceChild 激活脚本、用 addEventListener 绑定事件，
+    // 使 AI 生成的交互式 HTML 面板可以正常运作。
+    function activateScripts(container) {
+        // 1) 激活 <script>：用同名新元素替换，浏览器会当作新脚本执行
+        const scripts = container.querySelectorAll('script');
+        for (const oldScript of scripts) {
+            const newScript = document.createElement('script');
+            for (let i = 0; i < oldScript.attributes.length; i++) {
+                const a = oldScript.attributes[i];
+                newScript.setAttribute(a.name, a.value);
+            }
+            newScript.textContent = oldScript.textContent;
+            oldScript.parentNode.replaceChild(newScript, oldScript);
+        }
+        // 2) 激活内联事件属性
+        const events = [
+            'click', 'dblclick', 'mousedown', 'mouseup', 'mouseover', 'mouseout', 'mousemove',
+            'keydown', 'keyup', 'keypress',
+            'change', 'input', 'focus', 'blur', 'submit', 'reset',
+            'touchstart', 'touchend', 'touchmove'
+        ];
+        const elements = container.querySelectorAll('*');
+        for (const el of elements) {
+            for (const evt of events) {
+                const handler = el.getAttribute('on' + evt);
+                if (handler) {
+                    try {
+                        // addEventListener 中 this 指向元素，因此 handler 里的 this.style 等引用正常工作
+                        el.addEventListener(evt, new Function('event', handler));
+                    } catch (e) { /* 非法表达式静默跳过 */ }
+                }
+            }
+        }
+    }
     function processHTMLBlock(targetEl, rawContent, forceRender, skipHide) {
         if (!rawContent.trim()) return false;
         const unescaped = unescapeHTML(rawContent);
@@ -725,6 +794,7 @@
         if (container.dataset.lastContent !== unescaped) {
             container.innerHTML = unescaped;
             container.dataset.lastContent = unescaped;
+            activateScripts(container);
             if (!skipHide) hideOriginalNode(targetEl);
             walkDOM(container);
         }
@@ -776,32 +846,51 @@
     }
     function processEscapedHTMLInText(node) {
         const text = node.nodeValue;
-        if (!/&lt;\s*(div|span|section|article|table|nav|header|footer|details|summary)\b/i.test(text)) return false;
+        if (!text || !/&lt;\s*(div|span|section|article|table|nav|header|footer|details|summary)\b/i.test(text)) return false;
         let unescaped = unescapeHTML(text);
         if (unescaped === text || !isVisualHTMLBlock(unescaped)) return false;
-        try {
-            const container = document.createElement('span');
-            container.dataset.vizSource = 'escaped-rendered';
+        // 非破坏性：保留原 TextNode，在其旁插入渲染容器
+        const container = getOrCreateTwistTextRenderContainer(node, 'escaped-rendered');
+        if (!container) return false;
+        if (container.dataset.lastContent !== unescaped) {
             container.innerHTML = unescaped;
-            node.parentNode.replaceChild(container, node);
-            return true;
-        } catch (e) { return false; }
+            container.dataset.lastContent = unescaped;
+            activateScripts(container);
+        }
+        hideOriginalTextNode(node);
+        return true;
     }
     const processedTextNodes = new WeakSet();
     function processTextNode(node) {
         if (processedTextNodes.has(node)) return;
         const text = node.nodeValue;
         if (!text) return;
+        const parent = node.parentNode;
+        if (!parent || parent.nodeType !== 1) return;
+        // 不二次处理已渲染容器内的 TextNode
+        if (parent.dataset && (parent.dataset.vizSource === 'rendered' ||
+                               parent.dataset.vizSource === 'escaped-rendered' ||
+                               parent.dataset.vizSource === 'twist-rendered')) {
+            processedTextNodes.add(node);
+            return;
+        }
         if (text.includes('\\rotatebox') || text.includes('\\textcolor') || text.includes('\\scalebox') || text.includes('\\colorbox')) {
             const tokens = tokenize(text);
             const ast = parse(tokens);
             const html = renderAST(ast);
             if (html !== text && html !== text.replace(/\\\(/g, '').replace(/\\\)/g, '')) {
-                const span = document.createElement('span');
-                span.innerHTML = html;
-                span.dataset.vizSource = 'twist-rendered';
-                node.parentNode.replaceChild(span, node);
-                return;
+                // 非破坏性渲染：保留原 TextNode 不替换，在其旁插入渲染容器
+                const container = getOrCreateTwistTextRenderContainer(node, 'twist-rendered');
+                if (container) {
+                    if (container.dataset.lastContent !== html) {
+                        container.innerHTML = html;
+                        container.dataset.lastContent = html;
+                        activateScripts(container);
+                    }
+                    hideOriginalTextNode(node);
+                    // 故意不加入 processedTextNodes：流式更新中 React 写入新值时需重新渲染
+                    return;
+                }
             }
         }
         if (processEscapedHTMLInText(node)) return;
@@ -811,7 +900,7 @@
         if (node.nodeType === 1) {
             const tagName = node.tagName;
             if (['TEXTAREA', 'INPUT', 'SCRIPT', 'STYLE', 'NOSCRIPT', 'IFRAME'].includes(tagName)) return;
-            if (node.dataset && (node.dataset.vizSource === 'rendered' || node.dataset.vizSource === 'escaped-rendered')) return;
+            if (node.dataset && (node.dataset.vizSource === 'rendered' || node.dataset.vizSource === 'escaped-rendered' || node.dataset.vizSource === 'twist-rendered')) return;
             if (tagName === 'SPAN' && /ds-markdown-html/i.test(node.className || '')) { processDSMarkdownHTMLSpan(node); return; }
             const codeElements = node.querySelectorAll ? node.querySelectorAll('code') : [];
             for (const codeEl of codeElements) {
@@ -831,6 +920,11 @@
         if (!node) return;
         let target = node.nodeType === 3 ? node.parentNode : node;
         if (!target || target.nodeType !== 1) return;
+        // 跳过我们自己创建的渲染容器及其后代，避免递归扫描
+        if (target.dataset && (target.dataset.vizSource === 'rendered' ||
+                               target.dataset.vizSource === 'escaped-rendered' ||
+                               target.dataset.vizSource === 'twist-rendered')) return;
+        if (target.closest && target.closest('[data-viz-source="rendered"],[data-viz-source="escaped-rendered"],[data-viz-source="twist-rendered"]')) return;
         const dsHtmlAncestor = target.closest && target.closest('span.ds-markdown-html');
         if (dsHtmlAncestor) target = dsHtmlAncestor;
         pendingRoots.add(target);
